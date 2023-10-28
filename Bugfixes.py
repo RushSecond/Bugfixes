@@ -1563,7 +1563,7 @@ def modify_class(cls):
                         continue
 
                     for s in spells:
-                        if s.can_threaten(t.x, t.y) and s.can_pay_costs():
+                        if s.can_threaten(t.x, t.y) and s.caster.cool_downs.get(s, 0) <= 1:
                             self.threat_zone.add((t.x, t.y))
                             break
                     for b in buffs:
@@ -8901,10 +8901,157 @@ def modify_class(cls):
             if self.tag not in u.tags:
                 return False
             return self.caster.level.can_move(self.caster, u.x, u.y, teleport=True, force_swap=True)
+            
+    if cls is Unit:
+    
+        def get_ai_action(self):
+            assert(not self.is_player_controlled)
+            assert(self.is_alive())
+            assert(not self.killed)
+
+            # For now always channel if you can
+            if self.has_buff(ChannelBuff):
+                return PassAction()
+
+            for spell in self.spells:
+                if not spell.can_pay_costs():
+                    continue
+
+                spell_target = spell.get_ai_target()
+                if spell_target and not spell.can_cast(spell_target.x, spell_target.y):
+                    # Should not happen ever but sadly it does alot
+                    target_unit = self.level.get_unit_at(spell_target.x, spell_target.y)
+                    if target_unit:
+                        target_str = target_unit.name
+                        if target_unit == self:
+                            target_str = 'self'
+                    else:
+                        target_str = "empty tile"
+                    print("%s wants to cast %s on invalid target (%s)" % (self.name, spell.name, target_str))
+                    continue
+                if spell_target:
+                    return CastAction(spell, spell_target.x, spell_target.y)
+
+            # Stationary monsters pass if they cant cast
+            if self.stationary:
+                return PassAction()
+
+            # Currently select targets via controller
+            if not self.is_coward:
+                possible_movement_targets = [u for u in self.level.units if self.level.are_hostile(self, u) and u.turns_to_death is None and self.can_harm(u)]
+
+                # Non flying monsters will not move towards flyers over chasms
+                if not self.flying:
+                    possible_movement_targets = [u for u in possible_movement_targets if self.level.tiles[u.x][u.y].can_walk]
+
+                # The player is always prioritized if possible
+                if any(u.is_player_controlled for u in possible_movement_targets):
+                    possible_movement_targets = [u for u in possible_movement_targets if u.is_player_controlled]
+
+            # Cowards move away from closest enemy, swapping if neccecary
+            else:
+                enemies = [u for u in self.level.units if self.level.are_hostile(self, u)]
+                if enemies:
+                    enemies.sort(key = lambda u: distance(self, u))
+                    closest = enemies[0]
+
+                    def can_flee_to(p):
+                        unit = self.level.get_unit_at(p.x, p.y)
+                        if unit and are_hostile(self, unit):
+                            return False
+                        # Don't let cowards continually swap with each other- looks like no one is moving at all when that happens
+                        if unit and unit.is_coward:
+                            return False
+                        # Don't flee through a player, its confusing
+                        if unit and unit.is_player_controlled:
+                            return False
+                        # Don't swap with stationary units
+                        if unit and unit.stationary:
+                            return False
+                        # Must be able to walk on the tile
+                        if not self.level.can_stand(p.x, p.y, self, check_unit=False):
+                            return False
+                        # If there is a unit, *it* must be able to walk on the tile I am currently on
+                        '''Changed from
+                        if unit and not self.level.can_stand(p.x, p.y, unit, check_unit=False):'''
+                        if unit and not self.level.can_stand(self.x, self.y, unit, check_unit=False):
+                            return False
+                        return True
+
+                    best_flee_points = [p for p in self.level.get_adjacent_points(self, filter_walkable=False) if can_flee_to(p)]
+                    choices = [(p, distance(p, closest)) for p in best_flee_points]
+                    if best_flee_points:
+                        best_flee_points.sort(key = lambda p: distance(p, closest), reverse=True)
+
+                        best_dist = distance(best_flee_points[0], closest)
+                        best_flee_points = [p for p in best_flee_points if distance(p, closest) >= best_dist]
+
+                        p = random.choice(best_flee_points)
+                        return MoveAction(p.x, p.y)
+                    else:
+                        possible_movement_targets = None
+                else:
+                    possible_movement_targets = None
+
+            if not possible_movement_targets:
+
+                # Move randomly if there are no enemies in the level
+                possible_movement_targets = [p for p in self.level.get_adjacent_points(Point(self.x, self.y), check_unit=True, filter_walkable=False) if self.level.can_stand(p.x, p.y, self)]
+                if not possible_movement_targets:
+                    return PassAction()
+                else:
+                    p = random.choice(possible_movement_targets)
+                    return MoveAction(p.x, p.y)
+
+            target = min(possible_movement_targets, key = lambda t: distance(Point(self.x, self.y), Point(t.x, t.y)))
+
+            if distance(Point(target.x, target.y), Point(self.x, self.y)) >= 2:
+                path = self.level.find_path(Point(self.x, self.y), Point(target.x, target.y), self)
+
+                if path:
+                    if libtcod.path_size(path) > 0:
+                        x, y = libtcod.path_get(path, 0)
+                        if self.level.can_move(self, x, y):
+                            return MoveAction(x, y)
+
+                    libtcod.path_delete(path)
+
+            # If you cant do anything then pass
+            return PassAction()
+            
+    if cls is Level:
+        def can_move(self, unit, x, y, teleport=False, force_swap=False):
+
+            if not teleport and distance(Point(unit.x, unit.y), Point(x, y), diag=True) > 1.5:
+                return False
+
+            if not self.is_point_in_bounds(Point(x, y)):
+                return False
+
+            blocker = self.tiles[x][y].unit
+            if blocker is not None:
+                if force_swap:
+                    # Even with force swap, cannot force walkers onto chasms
+                    '''Changed from
+                    if not blocker.flying and not self.tiles[x][y].can_walk:'''
+                    if not blocker.flying and not blocker.can_walk(unit.x, unit.y):
+                        return False
+
+                elif not unit.is_player_controlled or unit.team != blocker.team or blocker.stationary:
+                    return False
+
+            if not unit.flying:
+                if not self.can_walk(x, y):
+                    return False
+            else:
+                if not self.tiles[x][y].can_fly:
+                    return False
+
+            return True
 
     for func_name, func in [(key, value) for key, value in locals().items() if callable(value)]:
         if hasattr(cls, func_name):
             setattr(cls, func_name, func)
 
-for cls in [Frostbite, MercurialVengeance, ThunderStrike, HealAlly, AetherDaggerSpell, OrbBuff, PyGameView, HibernationBuff, Hibernation, MulticastBuff, MulticastSpell, TouchOfDeath, BestowImmortality, Enlarge, LightningHaloBuff, LightningHaloSpell, ClarityIdolBuff, Unit, Buff, HallowFlesh, DarknessBuff, VenomSpit, VenomSpitSpell, Hunger, EyeOfRageSpell, Level, ReincarnationBuff, MagicMissile, InvokeSavagerySpell, StormNova, SummonIcePhoenix, IcePhoenixBuff, SlimeformBuff, LightningFrenzy, ArcaneCombustion, LightningWarp, NightmareBuff, HolyBlast, FalseProphetHolyBlast, Burst, RestlessDeadBuff, FlameGateBuff, StoneAuraBuff, IronSkinBuff, HolyShieldBuff, DispersionFieldBuff, SearingSealBuff, SearingSealSpell, MercurizeBuff, MagnetizeBuff, BurningBuff, BurningShrineBuff, EntropyBuff, EnervationBuff, OrbSpell, StormBreath, FireBreath, IceBreath, VoidBreath, HolyBreath, DarkBreath, GreyGorgonBreath, BatBreath, DragonRoarBuff, DragonRoarSpell, HungerLifeLeechSpell, BloodlustBuff, OrbControlSpell, SimpleBurst, PullAttack, LeapAttack, MonsterVoidBeam, ButterflyLightning, FiendStormBolt, LifeDrain, WizardLightningFlash, TideOfSin, WailOfPain, HagSwap, SimpleRangedAttack, WizardNightmare, WizardHealAura, SpiritShield, SimpleCurse, SimpleSummon, GlassyGaze, GhostFreeze, WizardBloodboil, CloudGeneratorBuff, TrollRegenBuff, DamageAuraBuff, CommonContent.ElementalEyeBuff, RegenBuff, ShieldRegenBuff, DeathExplosion, VolcanoTurtleBuff, SpiritBuff, NecromancyBuff, SporeBeastBuff, SpikeBeastBuff, BlizzardBeastBuff, VoidBomberBuff, FireBomberBuff, SpiderBuff, MushboomBuff, RedMushboomBuff, ThornQueenThornBuff, LesserCultistAlterBuff, GreaterCultistAlterBuff, CultNecromancyBuff, MagmaShellBuff, ToxicGazeBuff, ConstructShards, IronShell, ArcanePhoenixBuff, IdolOfSlimeBuff, CrucibleOfPainBuff, FieryVengeanceBuff, ConcussiveIdolBuff, VampirismIdolBuff, TeleportyBuff, LifeIdolBuff, PrinceOfRuin, StormCaller, Horror, FrozenSouls, ShrapnelBlast, ShieldSightSpell, GlobalAttrBonus, FaeThorns, Teleblink, AfterlifeShrineBuff, FrozenSkullShrineBuff, WhiteCandleShrineBuff, FaeShrineBuff, FrozenShrineBuff, CharredBoneShrineBuff, SoulpowerShrineBuff, BrightShrineBuff, GreyBoneShrineBuff, EntropyShrineBuff, EnervationShrineBuff, WyrmEggShrineBuff, ToxicAgonyBuff, BoneSplinterBuff, HauntingShrineBuff, ButterflyWingBuff, GoldSkullBuff, FurnaceShrineBuff, HeavenstrikeBuff, StormchargeBuff, WarpedBuff, TroublerShrineBuff, FaewitchShrineBuff, VoidBomberBuff, VoidBomberSuicide, FireBomberSuicide, BomberShrineBuff, SorceryShieldShrineBuff, FrostfaeShrineBuff, ChaosConductanceShrineBuff, ChaosQuillShrineBuff, FireflyShrineBuff, BloodrageShrineBuff, RazorShrineBuff, ShatterShards, ShockAndAwe, SteamAnima, Teleport, DeathBolt, SummonIceDrakeSpell, ChannelBuff, DeathCleaveBuff, CauterizingShrineBuff, Tile, SummonSiegeGolemsSpell, Approach, Crystallographer, Necrostatics, HeavenlyIdol, RingOfSpiders, UnholyAlliance, TurtleDefenseBonus, TurtleBuff, NaturalVigor, OakenShrineBuff, TundraShrineBuff, SwampShrineBuff, SandStoneShrineBuff, BlueSkyShrineBuff, MatureInto, SummonWolfSpell, AnnihilateSpell, MegaAnnihilateSpell, MeltBuff, CollectedAgony, MeteorShower, WizardQuakeport, PurityBuff, SummonGiantBear, SimpleMeleeAttack, ThornQueenThornBuff, FaeCourt, GhostfireUpgrade, SplittingBuff, GeneratorBuff, RespawnAs, EventHandler, SummonFloatingEye, SlimeBuff, Bolt, Spell, Icicle, PoisonSting, ArchonLightning, PyrostaticPulse, BombToss, GhostFreeze, CyclopsAllyBat, CyclopsEnemyBat, WizardIcicle, WizardIgnitePoison, SpellUpgrade, BlinkSpell, ThunderStrike, StoneAuraSpell, FrozenOrbSpell, WheelOfFate, SummonBlueLion, HolyFlame, HeavensWrath, FlockOfEaglesSpell, SummonSeraphim, EssenceAuraBuff, ConductanceSpell, PlagueOfFilth, ToxicSpore, PyrostaticHexSpell, PyroStaticHexBuff, MercurizeSpell, SummonVoidDrakeSpell, Megavenom, GeminiCloneSpell, Spells.ElementalEyeBuff, SeraphimSwordSwing, StunImmune, BlindBuff, WriteChaosScrolls, DispersalSpell, LastWord, BerserkShrineBuff, StormCloudShrineBuff, CruelShrineBuff, ThunderShrineBuff, MonsterChainLightning, Poison, TouchedBySorcery, GiantFireBombSuicide, HypocrisyStack, VenomBeastHealing, MagnetizeSpell, SummonSpiderQueen, MinionRepair, HealAuraBuff, HealMinionsSpell, AngelSong, FaestoneBuff, Soulbound, Starcharge, TideOfRot, Generator2Buff, BannerBuff, MarchOfTheRighteous, Thorns, SpiderSpawning, TombstoneSummon, Haunted, TreeThornSummon, SpawnOnDeath, OperateSiege, UnitSprite, Moonspeaker, LightningBoltSpell, Dominate, ShieldSiphon, IceTap, BreathWeapon, LevelGenerator, WizardStarfireBeam, HagDrain, WatcherFormBuff, Stun, DeathGazeSpell, WizardSwap]:
+for cls in [Unit, Level, Frostbite, MercurialVengeance, ThunderStrike, HealAlly, AetherDaggerSpell, OrbBuff, PyGameView, HibernationBuff, Hibernation, MulticastBuff, MulticastSpell, TouchOfDeath, BestowImmortality, Enlarge, LightningHaloBuff, LightningHaloSpell, ClarityIdolBuff, Unit, Buff, HallowFlesh, DarknessBuff, VenomSpit, VenomSpitSpell, Hunger, EyeOfRageSpell, Level, ReincarnationBuff, MagicMissile, InvokeSavagerySpell, StormNova, SummonIcePhoenix, IcePhoenixBuff, SlimeformBuff, LightningFrenzy, ArcaneCombustion, LightningWarp, NightmareBuff, HolyBlast, FalseProphetHolyBlast, Burst, RestlessDeadBuff, FlameGateBuff, StoneAuraBuff, IronSkinBuff, HolyShieldBuff, DispersionFieldBuff, SearingSealBuff, SearingSealSpell, MercurizeBuff, MagnetizeBuff, BurningBuff, BurningShrineBuff, EntropyBuff, EnervationBuff, OrbSpell, StormBreath, FireBreath, IceBreath, VoidBreath, HolyBreath, DarkBreath, GreyGorgonBreath, BatBreath, DragonRoarBuff, DragonRoarSpell, HungerLifeLeechSpell, BloodlustBuff, OrbControlSpell, SimpleBurst, PullAttack, LeapAttack, MonsterVoidBeam, ButterflyLightning, FiendStormBolt, LifeDrain, WizardLightningFlash, TideOfSin, WailOfPain, HagSwap, SimpleRangedAttack, WizardNightmare, WizardHealAura, SpiritShield, SimpleCurse, SimpleSummon, GlassyGaze, GhostFreeze, WizardBloodboil, CloudGeneratorBuff, TrollRegenBuff, DamageAuraBuff, CommonContent.ElementalEyeBuff, RegenBuff, ShieldRegenBuff, DeathExplosion, VolcanoTurtleBuff, SpiritBuff, NecromancyBuff, SporeBeastBuff, SpikeBeastBuff, BlizzardBeastBuff, VoidBomberBuff, FireBomberBuff, SpiderBuff, MushboomBuff, RedMushboomBuff, ThornQueenThornBuff, LesserCultistAlterBuff, GreaterCultistAlterBuff, CultNecromancyBuff, MagmaShellBuff, ToxicGazeBuff, ConstructShards, IronShell, ArcanePhoenixBuff, IdolOfSlimeBuff, CrucibleOfPainBuff, FieryVengeanceBuff, ConcussiveIdolBuff, VampirismIdolBuff, TeleportyBuff, LifeIdolBuff, PrinceOfRuin, StormCaller, Horror, FrozenSouls, ShrapnelBlast, ShieldSightSpell, GlobalAttrBonus, FaeThorns, Teleblink, AfterlifeShrineBuff, FrozenSkullShrineBuff, WhiteCandleShrineBuff, FaeShrineBuff, FrozenShrineBuff, CharredBoneShrineBuff, SoulpowerShrineBuff, BrightShrineBuff, GreyBoneShrineBuff, EntropyShrineBuff, EnervationShrineBuff, WyrmEggShrineBuff, ToxicAgonyBuff, BoneSplinterBuff, HauntingShrineBuff, ButterflyWingBuff, GoldSkullBuff, FurnaceShrineBuff, HeavenstrikeBuff, StormchargeBuff, WarpedBuff, TroublerShrineBuff, FaewitchShrineBuff, VoidBomberBuff, VoidBomberSuicide, FireBomberSuicide, BomberShrineBuff, SorceryShieldShrineBuff, FrostfaeShrineBuff, ChaosConductanceShrineBuff, ChaosQuillShrineBuff, FireflyShrineBuff, BloodrageShrineBuff, RazorShrineBuff, ShatterShards, ShockAndAwe, SteamAnima, Teleport, DeathBolt, SummonIceDrakeSpell, ChannelBuff, DeathCleaveBuff, CauterizingShrineBuff, Tile, SummonSiegeGolemsSpell, Approach, Crystallographer, Necrostatics, HeavenlyIdol, RingOfSpiders, UnholyAlliance, TurtleDefenseBonus, TurtleBuff, NaturalVigor, OakenShrineBuff, TundraShrineBuff, SwampShrineBuff, SandStoneShrineBuff, BlueSkyShrineBuff, MatureInto, SummonWolfSpell, AnnihilateSpell, MegaAnnihilateSpell, MeltBuff, CollectedAgony, MeteorShower, WizardQuakeport, PurityBuff, SummonGiantBear, SimpleMeleeAttack, ThornQueenThornBuff, FaeCourt, GhostfireUpgrade, SplittingBuff, GeneratorBuff, RespawnAs, EventHandler, SummonFloatingEye, SlimeBuff, Bolt, Spell, Icicle, PoisonSting, ArchonLightning, PyrostaticPulse, BombToss, GhostFreeze, CyclopsAllyBat, CyclopsEnemyBat, WizardIcicle, WizardIgnitePoison, SpellUpgrade, BlinkSpell, ThunderStrike, StoneAuraSpell, FrozenOrbSpell, WheelOfFate, SummonBlueLion, HolyFlame, HeavensWrath, FlockOfEaglesSpell, SummonSeraphim, EssenceAuraBuff, ConductanceSpell, PlagueOfFilth, ToxicSpore, PyrostaticHexSpell, PyroStaticHexBuff, MercurizeSpell, SummonVoidDrakeSpell, Megavenom, GeminiCloneSpell, Spells.ElementalEyeBuff, SeraphimSwordSwing, StunImmune, BlindBuff, WriteChaosScrolls, DispersalSpell, LastWord, BerserkShrineBuff, StormCloudShrineBuff, CruelShrineBuff, ThunderShrineBuff, MonsterChainLightning, Poison, TouchedBySorcery, GiantFireBombSuicide, HypocrisyStack, VenomBeastHealing, MagnetizeSpell, SummonSpiderQueen, MinionRepair, HealAuraBuff, HealMinionsSpell, AngelSong, FaestoneBuff, Soulbound, Starcharge, TideOfRot, Generator2Buff, BannerBuff, MarchOfTheRighteous, Thorns, SpiderSpawning, TombstoneSummon, Haunted, TreeThornSummon, SpawnOnDeath, OperateSiege, UnitSprite, Moonspeaker, LightningBoltSpell, Dominate, ShieldSiphon, IceTap, BreathWeapon, LevelGenerator, WizardStarfireBeam, HagDrain, WatcherFormBuff, Stun, DeathGazeSpell, WizardSwap]:
     curr_module.modify_class(cls)
